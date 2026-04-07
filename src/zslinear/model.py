@@ -503,6 +503,27 @@ def _regression_scoring(y: np.ndarray) -> str:
     return "neg_mean_absolute_error" if sk > 1.0 else "r2"
 
 
+def _regression_sample_weight(y: np.ndarray, n_bins: int = 10) -> np.ndarray:
+    """Inverse-frequency sample weights for continuous targets.
+
+    Bins ``y`` into ``n_bins`` quantile bins and assigns each sample a weight
+    proportional to 1 / (bin_count / n_samples), so that rare target regions
+    are up-weighted — analogous to ``class_weight='balanced'`` for classifiers.
+    """
+    from sklearn.utils.class_weight import compute_sample_weight
+
+    # Quantile binning handles skewed distributions better than equal-width.
+    quantiles = np.linspace(0, 100, n_bins + 1)
+    bin_edges = np.percentile(y, quantiles)
+    bin_edges = np.unique(bin_edges)          # collapse duplicates (discrete-ish targets)
+    n_unique_bins = len(bin_edges) - 1
+    if n_unique_bins < 2:
+        # Target has essentially one value; all weights equal.
+        return np.ones(len(y), dtype=float)
+    bin_ids = np.digitize(y, bin_edges[1:-1])  # 0-based bin index
+    return compute_sample_weight("balanced", bin_ids)
+
+
 # ---------------------------------------------------------------------------
 # Linear regressor
 # ---------------------------------------------------------------------------
@@ -518,6 +539,10 @@ class LinearRegressor:
 
     Feature scaling is NOT applied internally. Standardize X before calling fit().
     CV scoring is auto-selected based on target skewness (R² or neg_MAE).
+
+    Imbalanced target distributions are handled automatically: samples in rare
+    target regions are up-weighted via inverse-frequency quantile binning,
+    analogous to ``class_weight='balanced'`` for classifiers.
 
     Parameters
     ----------
@@ -593,6 +618,9 @@ class LinearRegressor:
 
         kf = KFold(n_splits=max(2, effective_cv), shuffle=True, random_state=self.random_state)
 
+        # --- Imbalance weights: inverse-frequency over quantile bins ---
+        sample_weight = _regression_sample_weight(y)
+
         # --- Preprocessing: VarianceThreshold only ---
         self._vt = VarianceThreshold(threshold=self.variance_threshold)
         try:
@@ -611,11 +639,11 @@ class LinearRegressor:
 
         # --- Dispatch ---
         if self.regime_ == "standard":
-            self._fit_standard(X_vt, y, n, p, kf, scoring)
+            self._fit_standard(X_vt, y, n, p, kf, scoring, sample_weight)
         elif self.regime_ == "high_dim":
-            self._fit_high_dim(X_vt, y, n, p, kf, scoring, effective_l1_ratio)
+            self._fit_high_dim(X_vt, y, n, p, kf, scoring, effective_l1_ratio, sample_weight)
         elif self.regime_ == "large":
-            self._fit_large(X_vt, y, n, p, kf, scoring, effective_l1_ratio)
+            self._fit_large(X_vt, y, n, p, kf, scoring, effective_l1_ratio, sample_weight)
         else:
             raise ValueError(f"Unknown regime: {self.regime_!r}.")
 
@@ -734,7 +762,7 @@ class LinearRegressor:
             return self._sfm.transform(X_vt)
         return X_vt
 
-    def _fit_standard(self, X, y, n, p, kf, scoring):
+    def _fit_standard(self, X, y, n, p, kf, scoring, sample_weight):
         self._sfm = None
         alpha_grid = np.asarray(self.alpha_values) if self.alpha_values is not None else _default_alpha_grid(n, p)
 
@@ -743,19 +771,19 @@ class LinearRegressor:
             cv=kf,
             scoring=scoring,
         )
-        self._estimator.fit(X, y)
+        self._estimator.fit(X, y, sample_weight=sample_weight)
 
-    def _fit_high_dim(self, X, y, n, p, kf, scoring, l1_ratio):
+    def _fit_high_dim(self, X, y, n, p, kf, scoring, l1_ratio, sample_weight):
         # Pre-filter with Lasso to reduce dimensionality
         max_feat = _sfm_max_features(n, p)
         pre_lasso = Lasso(alpha=1.0, max_iter=self.max_iter)
         self._sfm = SelectFromModel(estimator=pre_lasso, max_features=max_feat, threshold=-np.inf)
-        self._sfm.fit(X, y)
+        self._sfm.fit(X, y, sample_weight=sample_weight)
         X_sfm = self._sfm.transform(X)
 
         if X_sfm.shape[1] == 0:
             self._sfm = SelectFromModel(estimator=pre_lasso, max_features=1, threshold=-np.inf)
-            self._sfm.fit(X, y)
+            self._sfm.fit(X, y, sample_weight=sample_weight)
             X_sfm = self._sfm.transform(X)
 
         alpha_grid = np.asarray(self.alpha_values) if self.alpha_values is not None else _default_alpha_grid(n, X_sfm.shape[1])
@@ -767,9 +795,9 @@ class LinearRegressor:
             max_iter=self.max_iter,
             n_jobs=self.n_jobs,
         )
-        self._estimator.fit(X_sfm, y)
+        self._estimator.fit(X_sfm, y, sample_weight=sample_weight)
 
-    def _fit_large(self, X, y, n, p, kf, scoring, l1_ratio):
+    def _fit_large(self, X, y, n, p, kf, scoring, l1_ratio, sample_weight):
         self._sfm = None
         alpha_grid = np.asarray(self.alpha_values) if self.alpha_values is not None else _default_alpha_grid(n, p)
 
@@ -779,8 +807,10 @@ class LinearRegressor:
             rng = np.random.default_rng(self.random_state)
             sub_idx = rng.choice(n, size=sub_size, replace=False)
             X_sub, y_sub = X[sub_idx], y[sub_idx]
+            sw_sub = sample_weight[sub_idx]
         else:
             X_sub, y_sub = X, y
+            sw_sub = sample_weight
 
         base_sgd = SGDRegressor(
             loss="squared_error",
@@ -801,7 +831,7 @@ class LinearRegressor:
             n_jobs=self.n_jobs,
             refit=False,
         )
-        gs.fit(X_sub, y_sub)
+        gs.fit(X_sub, y_sub, sample_weight=sw_sub)
         best_alpha = gs.best_params_["alpha"]
 
         self._estimator = SGDRegressor(
@@ -812,7 +842,7 @@ class LinearRegressor:
             max_iter=1000,
             random_state=self.random_state,
         )
-        self._estimator.fit(X, y)
+        self._estimator.fit(X, y, sample_weight=sample_weight)
 
 
 # ---------------------------------------------------------------------------
