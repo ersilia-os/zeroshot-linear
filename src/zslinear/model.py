@@ -18,6 +18,7 @@ Literature basis:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
@@ -25,6 +26,7 @@ import joblib
 import numpy as np
 import scipy.sparse as sp
 from sklearn.exceptions import NotFittedError
+from sklearn.base import BaseEstimator
 from sklearn.feature_selection import SelectFromModel, VarianceThreshold
 from sklearn.linear_model import (
     ElasticNetCV,
@@ -42,6 +44,12 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.validation import check_array, check_is_fitted
 
 from zslinear.utils.logging import logger
+
+
+def _sklearn_kwargs(estimator, **kwargs):
+    if "use_legacy_attributes" in inspect.signature(estimator).parameters:
+        kwargs["use_legacy_attributes"] = False
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +114,7 @@ def _sfm_max_features(n: int, p: int) -> int:
 # Main classifier
 # ---------------------------------------------------------------------------
 
-class LinearClassifier:
+class LinearClassifier(BaseEstimator):
     """
     Binary logistic regression with embedded L1/ElasticNet feature selection.
 
@@ -374,26 +382,27 @@ class LinearClassifier:
         self._sfm = None
         C_grid = np.asarray(self.C_values) if self.C_values is not None else _default_C_grid(n, p)
 
-        self._estimator = LogisticRegressionCV(
+        self._estimator = LogisticRegressionCV(**_sklearn_kwargs(
+            LogisticRegressionCV,
             Cs=C_grid,
             cv=skf,
-            penalty="l1",
-            solver="liblinear",
+            solver="saga",
+            l1_ratios=[1],
             class_weight=self.class_weight,
             max_iter=self.max_iter,
             scoring=scoring,
             n_jobs=self.n_jobs,
             refit=True,
             random_state=self.random_state,
-        )
+        ))
         self._estimator.fit(X, y)
 
     def _fit_high_dim(self, X, y, n, p, skf, scoring, l1_ratio):
         # Pre-filter with fast liblinear L1 to reduce dimensionality
         max_feat = _sfm_max_features(n, p)
         pre_lr = LogisticRegression(
-            penalty="l1",
-            solver="liblinear",
+            solver="saga",
+            l1_ratio=1,
             C=1.0,
             class_weight=self.class_weight,
             max_iter=self.max_iter,
@@ -411,10 +420,10 @@ class LinearClassifier:
 
         C_grid = np.asarray(self.C_values) if self.C_values is not None else _default_C_grid(n, X_sfm.shape[1])
 
-        self._estimator = LogisticRegressionCV(
+        self._estimator = LogisticRegressionCV(**_sklearn_kwargs(
+            LogisticRegressionCV,
             Cs=C_grid,
             cv=skf,
-            penalty="elasticnet",
             solver="saga",
             l1_ratios=[l1_ratio],
             class_weight=self.class_weight,
@@ -423,7 +432,7 @@ class LinearClassifier:
             n_jobs=self.n_jobs,
             refit=True,
             random_state=self.random_state,
-        )
+        ))
         self._estimator.fit(X_sfm, y)
 
     def _fit_large(self, X, y, n, p, skf, scoring, l1_ratio):
@@ -528,7 +537,7 @@ def _regression_sample_weight(y: np.ndarray, n_bins: int = 10) -> np.ndarray:
 # Linear regressor
 # ---------------------------------------------------------------------------
 
-class LinearRegressor:
+class LinearRegressor(BaseEstimator):
     """
     Linear regression with embedded feature selection.
 
