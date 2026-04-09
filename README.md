@@ -1,3 +1,5 @@
+**THIS REPOSITORY HAS BEEN ARCHIVED AND INCORPORATED INTO [LAZY-QSAR](https://github.com/ersilia-os/lazy-qsar)**
+
 # Zero-shot Linear
 
 `zslinear` automatically selects solvers, regularization, and feature selection for linear classification and regression — no manual tuning required.
